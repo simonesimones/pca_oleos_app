@@ -1,173 +1,155 @@
-import io
-import zipfile
+import io, zipfile
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
+import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import dendrogram, cut_tree
+from core import preprocess,pca,diagnostics,correlations,hca
+st.set_page_config(page_title='Toolbox | Quimiometria',layout='wide')
+st.title('Toolbox de Quimiometria — PCA e HCA')
+st.caption('Análise exploratória • variáveis suplementares não participam do ajuste.')
 
-st.set_page_config(page_title='PCA | Óleos essenciais', layout='wide')
-st.title('PCA e biplots — caracterização temporal de óleos essenciais')
-st.caption('Compostos como variáveis ativas; ambiente como variáveis suplementares (correlações com os scores).')
-MESES = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez']
-COLORS = ['#337fd9','#2666cc','#40a659','#4db34d','#80bf33','#d9a61a','#e6661a','#d94026','#cc4d33','#b38026','#6699bf','#3373cc']
-
-def load_file(f):
+def read(f):
     if f.name.lower().endswith('.csv'):
-        raw=f.getvalue()
         for enc in ['utf-8-sig','latin-1']:
-            try:
-                return pd.read_csv(io.BytesIO(raw), sep=None, engine='python', encoding=enc)
-            except (UnicodeError, pd.errors.ParserError, ValueError):
-                continue
-        raise ValueError('CSV não reconhecido. Confira delimitador e codificação.')
+            try: return pd.read_csv(io.BytesIO(f.getvalue()),sep=None,engine='python',encoding=enc)
+            except (UnicodeError,pd.errors.ParserError): pass
+        raise ValueError('CSV inválido.')
     return pd.read_excel(f)
 
-def numcols(df, columns):
-    out=df[columns].copy()
-    for col in columns:
-        if out[col].dtype == 'object':
-            out[col]=out[col].astype(str).str.strip().str.replace(',','.',regex=False)
-        out[col]=pd.to_numeric(out[col], errors='coerce')
-    return out
+def numeric(df,cols):
+    return df[cols].apply(lambda s: pd.to_numeric(s.astype(str).str.strip().str.replace(',','.',regex=False),errors='coerce')).to_numpy(float)
 
-def make_pca(x, scaling):
-    mu=x.mean(axis=0)
-    sd=x.std(axis=0,ddof=1)
-    if np.any(sd<=1e-12):
-        raise ValueError('Há compostos constantes. Remova ou revise essas colunas.')
-    z=(x-mu)/sd if scaling=='Autoescalamento (z-score)' else x-mu
-    u,s,vt=np.linalg.svd(z,full_matrices=False)
-    coeff=vt.T
-    scores=u*s
-    latent=s**2/(len(x)-1)
-    explained=100*latent/latent.sum()
-    return z,coeff,scores,latent,explained
+def csv(df): return df.to_csv(index=True).encode('utf-8-sig')
 
-def points(fig,scores,months):
-    for i,m in enumerate(months):
-        fig.add_trace(go.Scatter(x=[scores[i,0]],y=[scores[i,1]],mode='markers+text',text=[MESES[m-1]],textposition='top center',marker=dict(size=12,color=COLORS[m-1],line=dict(color='black',width=0.7)),name=MESES[m-1],showlegend=False))
-
-def arrow(fig,x,y,name,color,dash='solid'):
-    fig.add_annotation(x=x,y=y,ax=0,ay=0,xref='x',yref='y',axref='x',ayref='y',showarrow=True,arrowhead=3,arrowsize=1,arrowwidth=2,arrowcolor=color,text='')
-    fig.add_annotation(x=x*1.12,y=y*1.12,text=name,showarrow=False,font=dict(color=color,size=12))
-    if dash=='dash':
-        fig.add_trace(go.Scatter(x=[0,x],y=[0,y],mode='lines',line=dict(color=color,width=2,dash='dash'),showlegend=False,hoverinfo='skip'))
-
-def style_xy(fig, explained, title):
-    fig.update_layout(title=title,xaxis_title=f'PC1 ({explained[0]:.1f}%)',yaxis_title=f'PC2 ({explained[1]:.1f}%)',template='plotly_white',height=590)
-    fig.add_hline(y=0,line_color='lightgray');fig.add_vline(x=0,line_color='lightgray')
-    return fig
-
-st.sidebar.header('1. Importação')
-mode=st.sidebar.radio('Formato dos dados',['Arquivo único','Arquivos separados'])
-if mode=='Arquivo único':
-    f=st.sidebar.file_uploader('CSV ou Excel: meses + compostos + ambiente',type=['csv','xlsx','xls'])
-    if not f:
-        st.info('Carregue um arquivo para iniciar. Uma linha por amostra; inclua uma coluna de mês, colunas de compostos e, opcionalmente, colunas ambientais.')
-        st.dataframe(pd.DataFrame({'Mes':list(range(1,13)),'Biciclogermacreno':['']*12,'D-Germacreno':['']*12,'E-Cariofileno':['']*12,'Temperatura':['']*12,'Umidade':['']*12,'Pluviosidade':['']*12,'Luminosidade':['']*12}))
-        st.stop()
-    try: df=load_file(f)
-    except Exception as e: st.error(str(e));st.stop()
-    env_df=df
-else:
-    fc=st.sidebar.file_uploader('Arquivo dos compostos',type=['csv','xlsx','xls'],key='comp')
-    fe=st.sidebar.file_uploader('Arquivo ambiental (opcional)',type=['csv','xlsx','xls'],key='amb')
-    if not fc: st.info('Carregue o arquivo dos compostos para iniciar.');st.stop()
-    try:
-        df=load_file(fc)
-        env_df=load_file(fe) if fe else None
-    except Exception as e: st.error(str(e));st.stop()
-
-st.subheader('Prévia dos dados de compostos')
-st.dataframe(df.head(15),use_container_width=True)
-cols=list(df.columns)
-st.sidebar.header('2. Seleção das colunas')
-month_col=st.sidebar.selectbox('Coluna de mês',cols,index=next((i for i,c in enumerate(cols) if str(c).lower() in ['mes','mês','month']),0))
-comp_defaults=[c for c in cols if c!=month_col][:3]
-comp_cols=st.sidebar.multiselect('Compostos ativos', [c for c in cols if c!=month_col],default=comp_defaults)
-if env_df is not None:
-    envcols=list(env_df.columns)
-    env_month_col=st.sidebar.selectbox('Coluna de mês no arquivo ambiental',envcols,index=next((i for i,c in enumerate(envcols) if str(c).lower() in ['mes','mês','month']),0)) if mode=='Arquivos separados' else month_col
-    amb_options=[c for c in envcols if c!=env_month_col and c not in (comp_cols if mode=='Arquivo único' else [])]
-    env_defaults=[c for c in amb_options if any(k in str(c).lower() for k in ['temp','umid','pluv','lumi'])]
-    env_cols=st.sidebar.multiselect('Variáveis ambientais suplementares',amb_options,default=env_defaults)
-else:
-    env_cols=[]
-scaling=st.sidebar.radio('Pré-processamento dos compostos',['Autoescalamento (z-score)','Centralização na média'])
-if len(comp_cols)<2: st.warning('Selecione pelo menos dois compostos.');st.stop()
-
+f=st.sidebar.file_uploader('1. Dados principais',type=['xlsx','xls','csv'])
+if not f:
+    st.info('Carregue uma planilha com cabeçalhos e uma linha por amostra. Identificadores e classes são opcionais.')
+    st.stop()
+try: df=read(f)
+except Exception as e: st.error(str(e)); st.stop()
+cols=list(df.columns); st.dataframe(df.head(15))
+idcol=st.sidebar.selectbox('Identificador da amostra',[None]+cols,format_func=lambda x:'Número da linha' if x is None else str(x))
+classcol=st.sidebar.selectbox('Coluna de classes',[None]+[c for c in cols if c!=idcol],format_func=lambda x:'Sem classes' if x is None else str(x))
+opts=[c for c in cols if c not in [idcol,classcol]]
+active=st.sidebar.multiselect('Variáveis ativas',opts,default=[])
+extra=st.sidebar.file_uploader('Arquivo suplementar (opcional)',type=['xlsx','xls','csv'])
 try:
-    months=pd.to_numeric(df[month_col],errors='raise').to_numpy()
-    if not np.all(np.isfinite(months)) or not np.all(np.isin(months,np.arange(1,13))):
-        raise ValueError('Os meses devem ser inteiros de 1 a 12, sem valores ausentes.')
-    months=months.astype(int)
-    if len(np.unique(months))!=len(months):
-        raise ValueError('Há meses repetidos. Esta versão exige uma amostra por mês.')
-    x=numcols(df,comp_cols).to_numpy(dtype=float)
-    if not np.isfinite(x).all(): raise ValueError('Há valores ausentes ou não numéricos nos compostos.')
-    if len(x)<3: raise ValueError('São necessárias pelo menos três amostras.')
-    env=None
-    if env_cols:
-        if mode=='Arquivos separados':
-            envmonths=pd.to_numeric(env_df[env_month_col],errors='raise').to_numpy()
-            if not np.all(np.isfinite(envmonths)) or not np.all(np.isin(envmonths,np.arange(1,13))) or len(set(envmonths))!=len(envmonths):
-                raise ValueError('Meses ambientais inválidos ou duplicados.')
-            ed=env_df.copy();ed['_mes_chave_']=envmonths.astype(int)
-            if not set(months).issubset(set(ed['_mes_chave_'])):
-                raise ValueError('O arquivo ambiental não contém todos os meses dos compostos.')
-            env=numcols(ed.set_index('_mes_chave_').loc[months].reset_index(),env_cols).to_numpy(dtype=float)
-        else:
-            env=numcols(env_df,env_cols).to_numpy(dtype=float)
-        if not np.isfinite(env).all(): raise ValueError('Há valores ausentes ou não numéricos nas variáveis ambientais.')
-    z,coeff,scores,latent,explained=make_pca(x,scaling)
-    corrs=None
-    if env is not None:
-        if np.any(env.std(axis=0,ddof=1)<=1e-12): raise ValueError('Há variáveis ambientais constantes.')
-        corrs=np.array([[np.corrcoef(env[:,j],scores[:,k])[0,1] for k in range(2)] for j in range(len(env_cols))])
-except Exception as e:
-    st.error(f'Verifique os dados: {e}');st.stop()
+    if extra:
+        ed=read(extra)
+        if idcol is None: raise ValueError('Selecione um identificador para alinhar arquivos separados.')
+        eid=st.sidebar.selectbox('Identificador no arquivo suplementar',list(ed.columns))
+        if df[idcol].isna().any() or ed[eid].isna().any() or df[idcol].duplicated().any() or ed[eid].duplicated().any(): raise ValueError('Identificadores devem ser únicos e não vazios.')
+        if set(df[idcol])!=set(ed[eid]): raise ValueError('Identificadores dos arquivos não coincidem.')
+        ed=ed.set_index(eid).loc[df[idcol]].reset_index(drop=True)
+        sup=st.sidebar.multiselect('Variáveis suplementares',list(ed.columns))
+    else:
+        ed=df; sup=st.sidebar.multiselect('Variáveis suplementares',[c for c in opts if c not in active])
+except Exception as e: st.error(str(e)); st.stop()
+if not active: st.info('Selecione as variáveis ativas na barra lateral.'); st.stop()
+scale=st.sidebar.radio('2. Pré-processamento',['Autoescalamento','Centralização'])
+weighted=st.sidebar.checkbox('Aplicar pesos individuais')
+w=np.ones(len(active))
+if weighted:
+    wt=st.sidebar.data_editor(pd.DataFrame({'Variável':active,'Peso':w}),disabled=['Variável'],hide_index=True,key='weights_'+str(active))
+    w=wt['Peso'].to_numpy(float)
+try:
+    z,mu,sd,w=preprocess(numeric(df,active),scale=='Autoescalamento',w)
+    t,p,l,ev=pca(z)
+    sx=numeric(ed,sup) if sup else None
+    if sx is not None and not np.isfinite(sx).all(): raise ValueError('Variáveis suplementares contêm valores inválidos.')
+except Exception as e: st.error(str(e)); st.stop()
+n,r=t.shape; pcs=[f'PC{i+1}' for i in range(r)]
+ids=df[idcol].astype(str).tolist() if idcol is not None else [str(i+1) for i in range(n)]
+classes=df[classcol].fillna('(ausente)').astype(str).to_numpy() if classcol is not None else np.repeat('Amostras',n)
+levels=list(dict.fromkeys(classes)); palette=plt.get_cmap('tab20'); markers=['o','s','^','D','v','P','X','*','<','>']
+st.sidebar.header('3. Aparência')
+font=st.sidebar.slider('Tamanho da fonte',8,22,11); size=st.sidebar.slider('Tamanho dos símbolos',10,200,45); labels=st.sidebar.checkbox('Exibir identificadores',True)
+width=st.sidebar.slider('Largura (polegadas)',5,16,8); height=st.sidebar.slider('Altura (polegadas)',4,12,6); dpi=st.sidebar.selectbox('Resolução PNG',[300,600,1200])
+styles={}
+with st.sidebar.expander('Cores e símbolos por classe'):
+    from matplotlib.colors import to_hex
+    for i,c in enumerate(levels):
+        styles[c]=(st.color_picker(c,to_hex(palette(i%20)),key=f'color{i}'),st.selectbox('Símbolo — '+c,markers,index=i%len(markers),key=f'marker{i}'))
+plt.rcParams.update({'font.size':font,'svg.fonttype':'none','pdf.fonttype':42})
+figs={}; tables={}
+def figure(name):
+    fig,ax=plt.subplots(figsize=(width,height)); figs[name]=fig; return fig,ax
 
-st.success(f'{len(x)} amostras | {len(comp_cols)} compostos | PC1 + PC2 = {explained[:2].sum():.2f}% da variância')
-st.caption('A PCA é exploratória. Associações ambientais são correlações descritivas, não evidências de causalidade.')
-figures={}
-scale=0.75*np.max(np.abs(scores[:,:2]))/max(np.max(np.abs(coeff[:,:2])),1e-12)
-fig1=go.Figure();points(fig1,scores,months)
-for j,c in enumerate(comp_cols): arrow(fig1,coeff[j,0]*scale,coeff[j,1]*scale,str(c),'#166534')
-style_xy(fig1,explained,'Biplot — compostos ativos (setas com escala gráfica)')
-figures['biplot_compostos']=fig1
-fig2=go.Figure();points(fig2,scores,months)
-for j,c in enumerate(comp_cols):arrow(fig2,coeff[j,0]*scale,coeff[j,1]*scale,str(c),'#166534')
-if corrs is not None:
-    for j,c in enumerate(env_cols):arrow(fig2,corrs[j,0]*scale*.85,corrs[j,1]*scale*.85,str(c),'#b45309','dash')
-style_xy(fig2,explained,'Biplot com ambiente suplementar (setas laranja tracejadas)')
-figures['biplot_ambiente']=fig2
-fig3=go.Figure();fig3.add_bar(x=[f'PC{i+1}' for i in range(len(explained))],y=explained,name='Individual')
-fig3.add_scatter(x=[f'PC{i+1}' for i in range(len(explained))],y=np.cumsum(explained),mode='lines+markers',name='Acumulada',yaxis='y2')
-fig3.update_layout(title='Variância explicada',yaxis=dict(title='Individual (%)'),yaxis2=dict(title='Acumulada (%)',overlaying='y',side='right',range=[0,105]),template='plotly_white',height=470)
-figures['variancia_explicada']=fig3
-fig4=go.Figure(data=go.Heatmap(z=coeff.T,x=[str(c) for c in comp_cols],y=[f'PC{i+1}' for i in range(coeff.shape[1])],colorscale='RdBu',reversescale=True,zmid=0,zmin=-1,zmax=1,text=np.round(coeff.T,3),texttemplate='%{text}',colorbar=dict(title='Coef.')))
-fig4.update_layout(title='Coeficientes das componentes (loadings)',height=420)
-figures['heatmap_loadings']=fig4
-order=np.argsort(months)
-fig5=go.Figure()
-for k in range(2):fig5.add_scatter(x=[MESES[m-1] for m in months[order]],y=scores[order,k],mode='lines+markers',name=f'PC{k+1} ({explained[k]:.1f}%)')
-fig5.update_layout(title='Scores por mês (ordem cronológica)',xaxis_title='Mês',yaxis_title='Score',template='plotly_white',height=470)
-figures['scores_mensais']=fig5
+def show(fig):
+    fig.tight_layout(); st.pyplot(fig)
 
-tabs=st.tabs(['Biplot compostos','Biplot + ambiente','Scree plot','Loadings','Scores mensais','Tabelas e exportação'])
-for tab,key in zip(tabs[:5],list(figures)):
-    with tab:st.plotly_chart(figures[key],use_container_width=True)
-with tabs[5]:
-    st.markdown('**Variância explicada**');st.dataframe(pd.DataFrame({'PC':[f'PC{i+1}' for i in range(len(explained))],'Autovalor':latent,'Variância (%)':explained,'Acumulada (%)':np.cumsum(explained)}),use_container_width=True)
-    st.markdown('**Coeficientes das componentes**');st.dataframe(pd.DataFrame(coeff,index=comp_cols,columns=[f'PC{i+1}' for i in range(coeff.shape[1])]),use_container_width=True)
-    st.markdown('**Scores**');st.dataframe(pd.DataFrame(scores,index=[MESES[m-1] for m in months],columns=[f'PC{i+1}' for i in range(scores.shape[1])]),use_container_width=True)
-    if corrs is not None:
-        st.markdown('**Correlações ambientais com scores**');st.dataframe(pd.DataFrame(corrs,index=env_cols,columns=['PC1','PC2']),use_container_width=True)
-    outputs={'variancia.csv':pd.DataFrame({'PC':np.arange(1,len(explained)+1),'autovalor':latent,'variancia_percentual':explained}).to_csv(index=False),'loadings.csv':pd.DataFrame(coeff,index=comp_cols).to_csv(),'scores.csv':pd.DataFrame(scores,index=months).to_csv()}
-    if corrs is not None:outputs['correlacoes_ambiente.csv']=pd.DataFrame(corrs,index=env_cols,columns=['PC1','PC2']).to_csv()
-    for name,fig in figures.items():outputs[name+'.html']=fig.to_html(full_html=True,include_plotlyjs=True)
-    buff=io.BytesIO()
-    with zipfile.ZipFile(buff,'w',zipfile.ZIP_DEFLATED) as zf:
-        for name,content in outputs.items():zf.writestr(name,content)
-    st.download_button('Baixar resultados e gráficos interativos (.zip)',buff.getvalue(),file_name='resultados_PCA_oleos.zip',mime='application/zip')
-st.caption('Nota metodológica: as setas de compostos representam autovetores reescalados para exibição; as ambientais representam correlações reescaladas. Seus comprimentos não devem ser comparados diretamente.')
+def scatter(ax,x,y):
+    for c in levels:
+        ix=classes==c; color,marker=styles[c]; ax.scatter(x[ix],y[ix],c=color,marker=marker,s=size,label=c,edgecolors='black',linewidths=.4)
+    if labels:
+        for i,s in enumerate(ids): ax.annotate(s,(x[i],y[i]),xytext=(4,4),textcoords='offset points',fontsize=max(7,font-2))
+    if classcol is not None: ax.legend()
+
+def arrows(ax,mat,names,color,ls='-'):
+    for (x,y),name in zip(mat,names):
+        if np.isfinite([x,y]).all():
+            ax.annotate('',(x,y),(0,0),arrowprops={'arrowstyle':'->','color':color,'linestyle':ls,'lw':1.5}); ax.annotate(str(name),(x,y),xytext=(4,4),textcoords='offset points',color=color)
+
+def axes_pc(ax,i,j):
+    ax.axhline(0,color='0.8'); ax.axvline(0,color='0.8'); ax.set(xlabel=f'{pcs[i]} ({ev[i]:.1f}%)',ylabel=f'{pcs[j]} ({ev[j]:.1f}%)'); ax.set_aspect('equal',adjustable='datalim'); ax.margins(.2)
+
+tables['scores']=pd.DataFrame(t,index=ids,columns=pcs); tables['loadings']=pd.DataFrame(p,index=active,columns=pcs); tables['variancia']=pd.DataFrame({'Autovalor':l,'Explicada (%)':ev,'Acumulada (%)':ev.cumsum()},index=pcs)
+tables['preprocessamento']=pd.DataFrame({'Media':mu,'Escala':sd,'Peso':w},index=active); tables['X_processada']=pd.DataFrame(z,index=ids,columns=active)
+ca=correlations(z,t); tables['correlacoes_ativas']=pd.DataFrame(ca,index=active,columns=pcs)
+cs=correlations(sx,t) if sup else None
+if sup: tables['correlacoes_suplementares']=pd.DataFrame(cs,index=sup,columns=pcs)
+pa,diag,ht,export=st.tabs(['PCA','Diagnóstico','HCA','Exportação'])
+with pa:
+    st.write(f'{n} amostras · {len(active)} variáveis · {r} PCs de posto numérico não nulo')
+    fig,ax=figure('variancia'); ax.bar(np.arange(1,r+1),ev,label='Individual'); ax.plot(np.arange(1,r+1),ev.cumsum(),'o-',label='Acumulada'); ax.set(xlabel='PC',ylabel='Variância (%)',ylim=(0,105)); ax.legend(); show(fig)
+    st.dataframe(tables['variancia'])
+    if r>=2:
+        i=st.selectbox('PC horizontal',range(r),format_func=lambda k:pcs[k]); j=st.selectbox('PC vertical',[k for k in range(r) if k!=i],format_func=lambda k:pcs[k]); ij=[i,j]
+        fig,ax=figure('scores'); scatter(ax,t[:,i],t[:,j]); axes_pc(ax,i,j); show(fig)
+        fig,ax=figure('biplot_loadings'); scatter(ax,t[:,i],t[:,j]); factor=.75*np.max(np.abs(t[:,ij]))/max(np.max(np.abs(p[:,ij])),1e-15); arrows(ax,p[:,ij]*factor,active,'#145a32'); axes_pc(ax,i,j); ax.set_title('Biplot: loadings × fator gráfico'); show(fig)
+        fig,ax=figure('circulo_correlacoes'); ax.add_patch(plt.Circle((0,0),1,fill=False,color='0.6')); arrows(ax,ca[:,ij],active,'#145a32');
+        if sup: arrows(ax,cs[:,ij],sup,'#a93226','--')
+        axes_pc(ax,i,j); ax.set(xlim=(-1.25,1.25),ylim=(-1.25,1.25),title='Correlações: ativas (verde), suplementares (vermelho)'); show(fig)
+        fig,ax=figure('biplot_suplementar'); ts=t[:,ij]/np.sqrt(l[ij]); scatter(ax,ts[:,0],ts[:,1]); arrows(ax,ca[:,ij],active,'#145a32');
+        if sup: arrows(ax,cs[:,ij],sup,'#a93226','--')
+        axes_pc(ax,i,j); ax.set_title('Scores normalizados e vetores de correlação'); show(fig)
+    else: st.info('Apenas uma PC disponível; gráficos bidimensionais não se aplicam.')
+    k=st.slider('PCs no mapa de loadings',1,r,min(r,5)) if r>1 else 1
+    fig,ax=figure('loadings'); im=ax.imshow(p[:,:k].T,aspect='auto',cmap='RdBu_r',vmin=-1,vmax=1); ax.set_xticks(range(len(active)),labels=active,rotation=45,ha='right'); ax.set_yticks(range(k),labels=pcs[:k]); fig.colorbar(im,ax=ax); show(fig)
+    ordercol=st.selectbox('Ordenar evolução dos scores por',[None]+cols,format_func=lambda x:'Ordem original' if x is None else str(x)); order=np.arange(n) if ordercol is None else df[ordercol].sort_values(kind='stable').index.to_numpy(); pc=st.selectbox('PC para evolução',range(r),format_func=lambda k:pcs[k]); fig,ax=figure('evolucao'); ax.plot(np.arange(n),t[order,pc],'o-'); ax.set_xticks(range(n),labels=np.asarray(ids)[order],rotation=45,ha='right'); ax.set_ylabel(pcs[pc]); show(fig)
+with diag:
+    a=st.slider('PCs retidas no diagnóstico',1,r,min(2,r)) if r>1 else 1
+    conf=st.selectbox('Quantil empírico',[.90,.95,.99],index=1)
+    T,Q,lt,lq=diagnostics(z,t,p,l,a,conf)
+    st.warning('Limites empíricos calculados nas próprias amostras: sinalização exploratória, não teste formal nem limite validado para novas amostras. Não exclua amostras automaticamente.')
+    if a==r: st.info('Todas as PCs retidas: Q é numericamente zero e não discrimina resíduos.')
+    flag=(T>lt)|((Q>lq) if a<r else False)
+    tables['diagnostico']=pd.DataFrame({'T2':T,'Q':Q,'Limite T2':lt,'Limite Q':lq,'Sinalizada':flag},index=ids); st.dataframe(tables['diagnostico'])
+    fig,ax=figure('T2_Q'); scatter(ax,T,Q); ax.axvline(lt,color='red',ls='--');
+    if a<r: ax.axhline(lq,color='red',ls='--')
+    ax.set(xlabel='Hotelling T²',ylabel='Resíduo Q'); show(fig)
+    for name,v,lim in [('T2',T,lt),('Q',Q,lq)]:
+        fig,ax=figure(name); scatter(ax,np.arange(n),v); ax.axhline(lim,color='red',ls='--'); ax.set(xlabel='Índice da amostra (base 0)',ylabel=name); show(fig)
+with ht:
+    st.caption('HCA sobre a matriz pré-processada completa, não sobre os scores truncados.')
+    method=st.selectbox('Ligação',['ward','average','complete','single','weighted']); metric=st.selectbox('Distância',['euclidean'] if method=='ward' else ['euclidean','cityblock','cosine','correlation','chebyshev']); groups=st.number_input('Número de grupos',1,n,min(3,n))
+    try:
+        link=hca(z,method,metric); membership=cut_tree(link,n_clusters=[groups]).ravel()+1
+        fig,ax=figure('dendrograma'); dendrogram(link,labels=ids,ax=ax,leaf_rotation=90,color_threshold=0,above_threshold_color='#333333'); ax.set_ylabel('Distância de ligação'); show(fig)
+        tables['HCA_grupos']=pd.DataFrame({'Grupo':membership,'Classe informada':classes},index=ids); tables['HCA_ligacoes']=pd.DataFrame(link,columns=['No1','No2','Distancia','N']); st.dataframe(tables['HCA_grupos'])
+    except Exception as e: st.error('HCA: '+str(e))
+with export:
+    st.caption('PNG na resolução selecionada; SVG e PDF vetoriais. Tabelas CSV e parâmetros de processamento.')
+    fmt=st.multiselect('Formatos de figuras',['png','svg','pdf'],default=['png','svg','pdf'])
+    tables['configuracao']=pd.DataFrame({'Valor':[scale,str(weighted),a,conf,method,metric,groups]},index=['Preprocessamento','Ponderacao','PCs diagnostico','Quantil','Ligacao HCA','Distancia HCA','Grupos HCA'])
+    if st.button('Preparar arquivo ZIP'):
+        buf=io.BytesIO()
+        with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED) as out:
+            for name,tab in tables.items(): out.writestr(name+'.csv',csv(tab))
+            for name,fig in figs.items():
+                for ext in fmt:
+                    b=io.BytesIO(); fig.savefig(b,format=ext,dpi=dpi,bbox_inches='tight'); out.writestr(name+'.'+ext,b.getvalue())
+        st.session_state['zip_result']=buf.getvalue()
+    if 'zip_result' in st.session_state: st.download_button('Baixar ZIP preparado',st.session_state['zip_result'],'resultados_quimiometria.zip',mime='application/zip'); st.caption('Após mudar configurações, prepare o ZIP novamente.')
+plt.close('all')
